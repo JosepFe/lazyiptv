@@ -1,0 +1,8 @@
+# Por si alguna vez se guardan aquí: nunca subir credenciales ni cachés
+config.json
+*.m3u
+*.m3u8
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+"""lazyiptv — navegador de IPTV en terminal, estilo lazygit.
+
+Grupos a la izquierda, canales a la derecha, Enter abre el canal en mpv.
+Reutiliza una única ventana de mpv (vía IPC) para no gastar conexiones.
+Admite varias listas: cuentas Xtream Codes y listas M3U (enlace o archivo).
+
+Uso:
+  lazyiptv              abre la lista (si hay varias, pregunta cuál)
+  lazyiptv NOMBRE       abre directamente la lista NOMBRE
+  lazyiptv add          añade una lista nueva
+  lazyiptv list         muestra las listas configuradas
+
+Funciona en Linux y en Windows (en Windows: pip install windows-curses, y mpv en el PATH).
+
+Linux:   ~/.config/lazyiptv/config.json            listas
+         ~/.config/lazyiptv/<lista>/favorites.json canales favoritos
+         ~/.config/lazyiptv/<lista>/groups.json    grupos fijados arriba
+         ~/.cache/lazyiptv/<lista>.json            caché (24 h, o 'r')
+Windows: lo mismo en %APPDATA%\\lazyiptv y %LOCALAPPDATA%\\lazyiptv
+"""
+import json
+import locale
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+
+try:
+    import curses
+except ImportError:
+    sys.exit("Falta la librería curses. En Windows instálala con:  pip install windows-curses")
+
+WINDOWS = os.name == "nt"
+
+if WINDOWS:
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "lazyiptv")
+    CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "lazyiptv")
+    MPV_IPC = r"\\.\pipe\lazyiptv-mpv"
+else:
+    CONFIG_DIR = os.path.expanduser("~/.config/lazyiptv")
+    CACHE_DIR = os.path.expanduser("~/.cache/lazyiptv")
+    MPV_IPC = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "lazyiptv-mpv.sock")
+
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+IPTVNATOR_DB = os.path.expanduser("~/.iptvnator/databases/iptvnator.db")
+USER_AGENT = "VLC/3.0"
+CACHE_MAX_AGE = 24 * 3600
+
+FAVS_ID = "__favs__"
+ALL_ID = "__all__"
+
+HELP = [
+    "lazyiptv — ayuda",
+    "",
+    "  j/k  ↑/↓        moverse",
+    "  h/l  ←/→  Tab   cambiar de panel",
+    "  Enter           abrir grupo / reproducir canal",
+    "  g / G           ir al principio / al final",
+    "  PgUp / PgDn     página arriba / abajo",
+    "  /               filtrar el panel actual (Esc borra el filtro)",
+    "  f               en un canal: añadir/quitar de ★ Favoritos",
+    "                  en un grupo: fijarlo arriba / soltarlo",
+    "  a               cambiar de lista o añadir una nueva",
+    "  x               parar el reproductor",
+    "  r               recargar lista de canales del servidor",
+    "  q               salir (mpv sigue abierto)",
+    "",
+    "  Consejo: en 'Todos los canales' el filtro busca en toda la lista.",
+    "  Para añadir listas: tecla a → '+ Añadir lista nueva' (o lazyiptv add)",
+    "",
+    "  Pulsa cualquier tecla para volver.",
+]
+
+
+# ---------- configuración ----------
+
+def slug(name):
+    text = unicodedata.normalize("NFKD", name.lower())
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-") or "lista"
+
+
+def xtream_from_url(url):
+    """Si es un enlace get.php?username=…&password=…, devuelve la cuenta Xtream equivalente."""
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    if parsed.path.endswith("get.php") and "username" in query and "password" in query:
+        return {"type": "xtream", "server": f"{parsed.scheme}://{parsed.netloc}",
+                "username": query["username"][0], "password": query["password"][0]}
+    return None
+
+
+def import_from_iptvnator():
+    """Saca la primera lista get.php de IPTVnator como cuenta Xtream."""
+    if not os.path.exists(IPTVNATOR_DB):
+        return None
+    db = sqlite3.connect(f"file:{IPTVNATOR_DB}?mode=ro", uri=True)
+    for name, url in db.execute("select name, url from playlists where url like '%get.php%'"):
+        account = xtream_from_url(url)
+        if account:
+            return {"name": name or "Principal", **account}
+    return None
+
+
+def write_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def migrate_v1(old):
+    """Formato antiguo (una sola cuenta en la raíz) → lista de cuentas.
+
+    Mueve favoritos, grupos fijados y caché a la carpeta de la cuenta.
+    """
+    account = {"name": "Principal", "type": "xtream", **old}
+    adir = account_dir(account)
+    os.makedirs(adir, exist_ok=True)
+    for fname in ("favorites.json", "groups.json"):
+        src = os.path.join(CONFIG_DIR, fname)
+        if os.path.exists(src):
+            os.replace(src, os.path.join(adir, fname))
+    old_cache = os.path.join(CACHE_DIR, "live.json")
+    if os.path.exists(old_cache):
+        os.replace(old_cache, cache_file(account))
+    return {"accounts": [account]}
+
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        if "accounts" not in cfg:
+            cfg = migrate_v1(cfg)
+            write_config(cfg)
+        return cfg
+    account = import_from_iptvnator()
+    cfg = {"accounts": [account] if account else []}
+    write_config(cfg)
+    return cfg
+
+
+def account_dir(account):
+    return os.path.join(CONFIG_DIR, slug(account["name"]))
+
+
+def cache_file(account):
+    return os.path.join(CACHE_DIR, slug(account["name"]) + ".json")
+
+
+def load_list(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_list(path, items):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=1, ensure_ascii=False)
+
+
+SOURCE_HELP = ("Pega el enlace M3U del proveedor, la dirección del servidor Xtream "
+               "(http://servidor:puerto) o la ruta a un archivo .m3u")
+
+
+def name_error(cfg, name):
+    if not name:
+        return "El nombre no puede estar vacío."
+    if any(slug(a["name"]) == slug(name) for a in cfg["accounts"]):
+        return f"Ya existe una lista llamada '{name}'."
+    return None
+
+
+def build_account(name, source, ask):
+    """Convierte lo que ha pegado el usuario en una cuenta.
+
+    `ask(etiqueta, secreto)` pide un dato más (usuario/contraseña); si devuelve None se cancela.
+    Lanza ValueError si no se reconoce el enlace.
+    """
+    source = source.strip().strip('"')
+    account = xtream_from_url(source)
+    if account:
+        pass  # enlace get.php: se usa la API Xtream, sin descargar la lista entera
+    elif os.path.exists(os.path.expanduser(source)):
+        account = {"type": "m3u", "url": os.path.abspath(os.path.expanduser(source))}
+    elif re.match(r"^https?://[^/]+/?$", source):
+        user = ask("Usuario:", False)
+        password = None if user is None else ask("Contraseña:", True)
+        if user is None or password is None:
+            return None
+        account = {"type": "xtream", "server": source.rstrip("/"), "username": user, "password": password}
+    elif source.startswith(("http://", "https://")):
+        account = {"type": "m3u", "url": source}
+    else:
+        raise ValueError("No reconozco eso como enlace, servidor ni archivo.")
+    return {"name": name, **account}
+
+
+def test_and_save(cfg, account):
+    """Descarga la lista para comprobar que funciona y la guarda. Devuelve los datos cargados."""
+    data = make_source(account).load_live(force=True)
+    cfg["accounts"].append(account)
+    write_config(cfg)
+    return data
+
+
+def add_account_wizard():
+    """Asistente de texto para 'lazyiptv add'."""
+    cfg = load_config()
+    print("Añadir lista a lazyiptv\n")
+    name = input("Nombre de la lista (p. ej. Casa, Fútbol…): ").strip()
+    error = name_error(cfg, name)
+    if error:
+        sys.exit(error)
+    print(f"\n{SOURCE_HELP}.\n(Si es un enlace get.php?username=…, se usará como Xtream, que va más rápido.)")
+    try:
+        account = build_account(name, input("> "), lambda label, secret: input(label + " ").strip())
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print("Probando…", end=" ", flush=True)
+    try:
+        data = test_and_save(cfg, account)
+    except Exception as exc:
+        sys.exit(f"no funciona: {exc}")
+    print(f"OK, {len(data['streams'])} canales en {len(data['categories'])} grupos.")
+    print(f"Guardada. Ábrela con:  lazyiptv {slug(name)}")
+
+
+def list_accounts():
+    cfg = load_config()
+    if not cfg["accounts"]:
+        print("No hay listas. Añade una con:  lazyiptv add")
+    for a in cfg["accounts"]:
+        where = a.get("server") if a["type"] == "xtream" else a.get("url", "")
+        where = re.sub(r"(username|password)=[^&]+", r"\1=***", where)
+        print(f"  {slug(a['name']):20} {a['type']:7} {where}")
+
+
+# ---------- fuentes ----------
+
+def http_get(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+class Source:
+    """Base: guarda en caché {"time", "categories", "streams"} con el formato de Xtream."""
+
+    def __init__(self, account):
+        self.account = account
+        self.cache = cache_file(account)
+
+    def fetch(self):
+        raise NotImplementedError
+
+    def stream_url(self, stream):
+        raise NotImplementedError
+
+    def load_live(self, force=False):
+        if not force and os.path.exists(self.cache):
+            with open(self.cache, encoding="utf-8") as f:
+                data = json.load(f)
+            if time.time() - data.get("time", 0) < CACHE_MAX_AGE:
+                return data
+        categories, streams = self.fetch()
+        data = {"time": time.time(), "categories": categories, "streams": streams}
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(self.cache, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return data
+
+
+class XtreamSource(Source):
+    def api(self, **params):
+        a = self.account
+        query = urllib.parse.urlencode({"username": a["username"], "password": a["password"], **params})
+        with http_get(f"{a['server'].rstrip('/')}/player_api.php?{query}") as resp:
+            return json.load(resp)
+
+    def fetch(self):
+        return self.api(action="get_live_categories"), self.api(action="get_live_streams")
+
+    def stream_url(self, stream):
+        a = self.account
+        return f"{a['server'].rstrip('/')}/live/{a['username']}/{a['password']}/{stream['stream_id']}.ts"
+
+
+ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+
+
+class M3USource(Source):
+    def lines(self):
+        url = self.account["url"]
+        if os.path.exists(url):
+            with open(url, encoding="utf-8", errors="replace") as f:
+                yield from f
+        else:
+            with http_get(url, timeout=300) as resp:
+                for raw in resp:
+                    yield raw.decode("utf-8", errors="replace")
+
+    def fetch(self):
+        groups, streams, info = {}, [], None
+        for line in self.lines():
+            line = line.strip()
+            if line.startswith("#EXTINF"):
+                info = line
+            elif line and not line.startswith("#") and info:
+                attrs = dict(ATTR_RE.findall(info))
+                rest = ATTR_RE.sub("", info)
+                name = rest.split(",", 1)[1].strip() if "," in rest else attrs.get("tvg-name", "?")
+                group = attrs.get("group-title") or "Sin grupo"
+                cid = groups.setdefault(group, str(len(groups) + 1))
+                # el id es la URL: así favoritos siguen valiendo aunque la lista cambie de orden
+                streams.append({"stream_id": line, "name": name or "?", "category_id": cid})
+                info = None
+        categories = [{"category_id": cid, "category_name": g} for g, cid in groups.items()]
+        return categories, streams
+
+    def stream_url(self, stream):
+        return stream["stream_id"]
+
+
+def make_source(account):
+    return XtreamSource(account) if account["type"] == "xtream" else M3USource(account)
+
+
+# ---------- reproductor ----------
+
+def mpv_send(command):
+    """Envía un comando JSON al mpv abierto. Devuelve False si no hay mpv escuchando."""
+    payload = (json.dumps({"command": command}) + "\n").encode()
+    try:
+        if WINDOWS:
+            with open(MPV_IPC, "r+b", buffering=0) as pipe:
+                pipe.write(payload)
+        else:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                sock.connect(MPV_IPC)
+                sock.sendall(payload)
+        return True
+    except OSError:
+        return False
+
+
+def play(url, title):
+    """Abre la URL en el mpv de lazyiptv. Devuelve un mensaje de error o None."""
+    if mpv_send(["loadfile", url, "replace"]):
+        mpv_send(["set_property", "force-media-title", title])
+        return None
+    mpv = shutil.which("mpv")
+    if not mpv:
+        return "No encuentro mpv. Instálalo y asegúrate de que está en el PATH."
+    detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+              if WINDOWS else {"start_new_session": True})
+    subprocess.Popen(
+        [mpv, f"--input-ipc-server={MPV_IPC}", f"--user-agent={USER_AGENT}",
+         f"--force-media-title={title}", "--cache=yes", "--demuxer-max-bytes=50MiB",
+         # si el servidor corta la conexión (pasa a menudo en IPTV), reconectar en vez de cerrar mpv
+         "--stream-lavf-o=reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,"
+         "reconnect_on_network_error=1,reconnect_delay_max=10", url],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **detach,
+    )
+    return None
+
+
+def stop():
+    return mpv_send(["quit"])
+
+
+# ---------- utilidades de texto ----------
+
+def clip(text, width):
+    """Recorta respetando caracteres anchos (emojis, CJK) para no romper el layout."""
+    out, used = [], 0
+    for ch in text:
+        if unicodedata.category(ch) in ("Cc", "Cf"):
+            continue
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + " " * max(0, width - used)
+
+
+def normalize(text):
+    text = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+# ---------- interfaz ----------
+
+class Pane:
+    def __init__(self, title):
+        self.title = title
+        self.items = []      # lista de (id, etiqueta)
+        self.filter = ""
+        self.cursor = 0
+        self.top = 0
+
+    def visible(self):
+        if not self.filter:
+            return self.items
+        words = normalize(self.filter).split()
+        return [it for it in self.items if all(w in normalize(it[1]) for w in words)]
+
+    def selected(self):
+        vis = self.visible()
+        return vis[self.cursor] if vis else None
+
+    def move(self, delta):
+        n = len(self.visible())
+        self.cursor = max(0, min(n - 1, self.cursor + delta)) if n else 0
+
+    def reset(self):
+        self.cursor = self.top = 0
+
+
+class App:
+    def __init__(self, screen, cfg, account):
+        self.screen = screen
+        self.cfg = cfg
+        self.groups = Pane("Grupos")
+        self.channels = Pane("Canales")
+        self.focus = self.groups
+        self.status = ""
+        self.playing = ""
+        self.typing = False
+        self.open_account(account)
+
+    # datos
+    def open_account(self, account):
+        self.account = account
+        self.source = make_source(account)
+        adir = account_dir(account)
+        self.favs_file = os.path.join(adir, "favorites.json")
+        self.groups_file = os.path.join(adir, "groups.json")
+        self.favs = set(load_list(self.favs_file))
+        self.pinned = load_list(self.groups_file)  # ids de grupo, en el orden en que se fijaron
+        self.groups.filter = self.channels.filter = ""
+        self.focus = self.groups
+        self.load(force=False)
+
+    def load(self, force):
+        self.message(f"Cargando {self.account['name']}…")
+        self.status = ""
+        try:
+            data = self.source.load_live(force=force)
+        except Exception as exc:  # red caída, credenciales mal, etc.
+            self.status = f"Error cargando canales: {exc}"
+            data = {"categories": [], "streams": []}
+        self.streams = data["streams"]
+        self.by_id = {str(s["stream_id"]): s for s in self.streams}
+        self.by_cat = {}
+        for s in self.streams:
+            self.by_cat.setdefault(str(s.get("category_id")), []).append(s)
+        self.categories = data["categories"]
+        self.build_groups()
+        self.groups.reset()
+        self.fill_channels()
+        if not self.status:
+            self.status = f"{len(self.streams)} canales en {len(data['categories'])} grupos"
+
+    def build_groups(self):
+        """Favoritos, luego los grupos fijados (en su orden), luego Todos y el resto."""
+        labels = {
+            str(c["category_id"]): f"{c['category_name'].strip()} ({len(self.by_cat.get(str(c['category_id']), []))})"
+            for c in self.categories
+        }
+        pinned = [gid for gid in self.pinned if gid in labels]
+        self.groups.items = [(FAVS_ID, "★ Favoritos")]
+        self.groups.items += [(gid, labels[gid]) for gid in pinned]
+        self.groups.items.append((ALL_ID, f"Todos los canales ({len(self.streams)})"))
+        self.groups.items += [(gid, label) for gid, label in labels.items() if gid not in pinned]
+
+    def fill_channels(self):
+        group = self.groups.selected()
+        if not group:
+            self.channels.items = []
+        else:
+            gid = group[0]
+            if gid == FAVS_ID:
+                streams = [self.by_id[i] for i in sorted(self.favs) if i in self.by_id]
+            elif gid == ALL_ID:
+                streams = self.streams
+            else:
+                streams = self.by_cat.get(gid, [])
+            self.channels.items = [(str(s["stream_id"]), s["name"].strip()) for s in streams]
+            self.channels.title = group[1]
+        self.channels.filter = ""
+        self.channels.reset()
+
+    # dibujo
+    def message(self, text):
+        h, w = self.screen.getmaxyx()
+        self.screen.erase()
+        try:
+            self.screen.addstr(h // 2, max(0, (w - len(text)) // 2), clip(text, w - 1))
+        except curses.error:
+            pass
+        self.screen.refresh()
+
+    def draw_pane(self, pane, y, x, h, w, title=None):
+        active = pane is self.focus
+        border = curses.color_pair(1) | curses.A_BOLD if active else curses.color_pair(3)
+        win = self.screen.derwin(h, w, y, x)
+        win.attrset(border)
+        win.box()
+        title = f" {title or pane.title} "
+        if pane.filter or (self.typing and active):
+            title += f"/ {pane.filter}{'▏' if self.typing and active else ''} "
+        win.addstr(0, 2, clip(title, w - 4).rstrip(), border)
+        vis = pane.visible()
+        rows = h - 2
+        if pane.cursor < pane.top:
+            pane.top = pane.cursor
+        elif pane.cursor >= pane.top + rows:
+            pane.top = pane.cursor - rows + 1
+        for i, (iid, label) in enumerate(vis[pane.top:pane.top + rows]):
+            idx = pane.top + i
+            starred = iid in (self.favs if pane is self.channels else self.pinned)
+            mark = "★ " if starred else "  "
+            attr = curses.A_NORMAL
+            if idx == pane.cursor:
+                attr = curses.color_pair(2) | curses.A_BOLD if active else curses.A_REVERSE
+            try:
+                win.addstr(1 + i, 1, clip(mark + label, w - 2), attr)
+            except curses.error:
+                pass
+        if not vis:
+            win.addstr(1, 2, clip("(vacío)", w - 4), curses.A_DIM)
+        count = f" {pane.cursor + 1 if vis else 0}/{len(vis)} "
+        try:
+            win.addstr(h - 1, max(1, w - len(count) - 2), count, border)
+        except curses.error:
+            pass
+
+    def draw(self):
+        self.screen.erase()
+        h, w = self.screen.getmaxyx()
+        if h < 8 or w < 40:
+            self.message("Ventana demasiado pequeña")
+            return
+        left = max(24, w // 3)
+        self.draw_pane(self.groups, 0, 0, h - 2, left, f"{self.account['name']} · Grupos")
+        self.draw_pane(self.channels, 0, left, h - 2, w - left)
+        playing = f"▶ {self.playing}   " if self.playing else ""
+        try:
+            self.screen.addstr(h - 2, 1, clip(playing + self.status, w - 2), curses.color_pair(1))
+            keys = "Enter abrir · / filtrar · f favorito · a lista · x parar · r recargar · ? ayuda · q salir"
+            self.screen.addstr(h - 1, 1, clip(keys, w - 2), curses.A_DIM)
+        except curses.error:
+            pass
+        self.screen.refresh()
+
+    def show_help(self):
+        self.screen.erase()
+        for i, line in enumerate(HELP):
+            try:
+                self.screen.addstr(1 + i, 2, line, curses.A_BOLD if i == 0 else curses.A_NORMAL)
+            except curses.error:
+                pass
+        self.screen.refresh()
+        self.screen.get_wch()
+
+    # acciones
+    def activate(self):
+        if self.focus is self.groups:
+            self.focus = self.channels
+            return
+        item = self.channels.selected()
+        if item:
+            error = play(self.source.stream_url(self.by_id[item[0]]), item[1])
+            if error:
+                self.status = error
+            else:
+                self.playing = item[1]
+                self.status = "Abriendo en mpv…"
+
+    def switch_account(self):
+        accounts = self.cfg["accounts"]
+        current = accounts.index(self.account) if self.account in accounts else 0
+        choice = choose_account(self.screen, self.cfg, current)
+        if choice is not None and choice is not self.account:
+            self.open_account(choice)
+
+    def toggle_fav(self):
+        if self.focus is self.groups:
+            self.toggle_pin()
+            return
+        item = self.channels.selected()
+        if not item:
+            return
+        if item[0] in self.favs:
+            self.favs.discard(item[0])
+            self.status = f"Quitado de favoritos: {item[1]}"
+        else:
+            self.favs.add(item[0])
+            self.status = f"Añadido a favoritos: {item[1]}"
+        save_list(self.favs_file, sorted(self.favs))
+        if self.groups.selected() and self.groups.selected()[0] == FAVS_ID:
+            self.fill_channels()
+
+    def toggle_pin(self):
+        item = self.groups.selected()
+        if not item or item[0] in (FAVS_ID, ALL_ID):
+            return
+        if item[0] in self.pinned:
+            self.pinned.remove(item[0])
+            self.status = f"Grupo soltado: {item[1]}"
+        else:
+            self.pinned.append(item[0])
+            self.status = f"Grupo fijado arriba: {item[1]}"
+        save_list(self.groups_file, self.pinned)
+        self.build_groups()
+        # mantener el cursor sobre el mismo grupo tras reordenar
+        ids = [gid for gid, _ in self.groups.visible()]
+        self.groups.cursor = ids.index(item[0]) if item[0] in ids else 0
+
+    def handle_typing(self, key):
+        pane = self.focus
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            self.typing = False
+        elif key == "\x1b":
+            self.typing = False
+            pane.filter = ""
+        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b", "\x08"):
+            pane.filter = pane.filter[:-1]
+        elif key in (curses.KEY_UP, curses.KEY_DOWN):
+            pane.move(-1 if key == curses.KEY_UP else 1)
+            return
+        elif isinstance(key, str) and key.isprintable():
+            pane.filter += key
+        else:
+            return
+        pane.reset()
+        if pane is self.groups:
+            self.fill_channels()
+
+    def run(self):
+        while True:
+            self.draw()
+            key = self.screen.get_wch()
+            if self.typing:
+                self.handle_typing(key)
+                continue
+            pane = self.focus
+            page = max(1, self.screen.getmaxyx()[0] - 4)
+            before = self.groups.selected()
+            if key in ("q", "Q"):
+                return
+            elif key in ("j", curses.KEY_DOWN):
+                pane.move(1)
+            elif key in ("k", curses.KEY_UP):
+                pane.move(-1)
+            elif key == curses.KEY_NPAGE:
+                pane.move(page)
+            elif key == curses.KEY_PPAGE:
+                pane.move(-page)
+            elif key in ("g", curses.KEY_HOME):
+                pane.move(-10**9)
+            elif key in ("G", curses.KEY_END):
+                pane.move(10**9)
+            elif key in ("l", curses.KEY_RIGHT):
+                self.focus = self.channels
+            elif key in ("h", curses.KEY_LEFT):
+                self.focus = self.groups
+            elif key == "\t":
+                self.focus = self.channels if pane is self.groups else self.groups
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.activate()
+            elif key == "/":
+                self.typing = True
+            elif key == "\x1b":
+                pane.filter = ""
+                pane.reset()
+                if pane is self.groups:
+                    self.fill_channels()
+            elif key == "f":
+                self.toggle_fav()
+            elif key == "a":
+                self.switch_account()
+                continue
+            elif key == "x":
+                self.status = "Reproductor parado" if stop() else "No hay reproductor abierto"
+                self.playing = ""
+            elif key == "r":
+                self.load(force=True)
+                continue
+            elif key == "?":
+                self.show_help()
+            if self.groups.selected() != before:
+                self.fill_channels()
+
+
+ADD = "__add__"
+
+
+def pick_account(screen, accounts, current=0):
+    """Pantalla para elegir lista. Devuelve la cuenta, ADD para añadir una, o None si se cancela."""
+    options = accounts + [ADD]
+    cursor = current
+    while True:
+        screen.erase()
+        h, w = screen.getmaxyx()
+        try:
+            screen.addstr(1, 2, "¿Qué lista abro?", curses.color_pair(1) | curses.A_BOLD)
+            for i, a in enumerate(options[: max(0, h - 5)]):
+                if a is ADD:
+                    label = "+ Añadir lista nueva"
+                else:
+                    label = f"{a['name']}  ({'Xtream' if a['type'] == 'xtream' else 'M3U'})"
+                attr = curses.color_pair(2) | curses.A_BOLD if i == cursor else curses.A_NORMAL
+                screen.addstr(3 + i, 4, clip(label, w - 8), attr)
+            screen.addstr(h - 1, 2, clip("Enter elegir · j/k moverse · Esc/q cancelar", w - 4), curses.A_DIM)
+        except curses.error:
+            pass
+        screen.refresh()
+        key = screen.get_wch()
+        if key in ("j", curses.KEY_DOWN):
+            cursor = min(len(options) - 1, cursor + 1)
+        elif key in ("k", curses.KEY_UP):
+            cursor = max(0, cursor - 1)
+        elif key in ("g", curses.KEY_HOME):
+            cursor = 0
+        elif key in ("G", curses.KEY_END):
+            cursor = len(options) - 1
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            return options[cursor]
+        elif key in ("q", "\x1b"):
+            return None
+
+
+def show_lines(screen, lines, wait=True):
+    """Pantalla de aviso. Con wait=True espera una tecla."""
+    screen.erase()
+    h, w = screen.getmaxyx()
+    try:
+        screen.addstr(1, 2, "Añadir lista", curses.color_pair(1) | curses.A_BOLD)
+        for i, line in enumerate(lines):
+            screen.addstr(3 + i, 2, clip(line, w - 4))
+        if wait:
+            screen.addstr(h - 1, 2, clip("Pulsa cualquier tecla para seguir", w - 4), curses.A_DIM)
+    except curses.error:
+        pass
+    screen.refresh()
+    if wait:
+        screen.get_wch()
+
+
+def prompt(screen, label, secret=False, hint=""):
+    """Campo de texto. Devuelve lo escrito, o None si se pulsa Esc."""
+    text = ""
+    while True:
+        screen.erase()
+        h, w = screen.getmaxyx()
+        shown = ("•" * len(text)) if secret else text
+        room = w - 8
+        if len(shown) > room:  # enlaces largos: se ve el final, que es lo que se está escribiendo
+            shown = "…" + shown[-(room - 1):]
+        try:
+            screen.addstr(1, 2, "Añadir lista", curses.color_pair(1) | curses.A_BOLD)
+            row = 3
+            if hint:
+                screen.addstr(row, 2, clip(hint, w - 4), curses.A_DIM)
+                row += 2
+            screen.addstr(row, 2, clip(label, w - 4), curses.A_BOLD)
+            screen.addstr(row + 1, 2, "> " + shown + "▏", curses.color_pair(1))
+            screen.addstr(h - 1, 2, clip("Enter aceptar · Esc cancelar · se puede pegar con Ctrl+Shift+V", w - 4),
+                          curses.A_DIM)
+        except curses.error:
+            pass
+        screen.refresh()
+        key = screen.get_wch()
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            return text.strip()
+        if key == "\x1b":
+            return None
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\b", "\x08"):
+            text = text[:-1]
+        elif key == "\x15":  # Ctrl+U: borrar todo
+            text = ""
+        elif isinstance(key, str) and key.isprintable():
+            text += key
+
+
+def add_account_tui(screen, cfg):
+    """Asistente de 'Añadir lista' dentro del programa. Devuelve la cuenta nueva o None."""
+    name = prompt(screen, "Nombre de la lista:", hint="Por ejemplo: Casa, Fútbol, Lista de Juan…")
+    if name is None:
+        return None
+    error = name_error(cfg, name)
+    if error:
+        show_lines(screen, [error])
+        return None
+    source = prompt(screen, "Enlace o archivo:", hint=SOURCE_HELP + ".")
+    if not source:
+        return None
+    try:
+        account = build_account(name, source, lambda label, secret: prompt(screen, label, secret))
+    except ValueError as exc:
+        show_lines(screen, [str(exc)])
+        return None
+    if account is None:
+        return None
+    show_lines(screen, [f"Probando '{name}'…", "", "Si es una lista M3U muy grande, puede tardar un rato."], wait=False)
+    try:
+        data = test_and_save(cfg, account)
+    except Exception as exc:
+        show_lines(screen, ["No funciona, no la guardo:", str(exc)])
+        return None
+    show_lines(screen, [f"Lista '{name}' guardada: {len(data['streams'])} canales en {len(data['categories'])} grupos."])
+    return account
+
+
+def choose_account(screen, cfg, current=0):
+    """Elegir lista (o añadir una). Devuelve la cuenta a abrir o None."""
+    while True:
+        if not cfg["accounts"]:
+            account = add_account_tui(screen, cfg)
+            if account or not cfg["accounts"]:
+                return account
+            continue
+        choice = pick_account(screen, cfg["accounts"], current)
+        if choice is not ADD:
+            return choice
+        account = add_account_tui(screen, cfg)
+        if account:
+            return account
+
+
+def main(screen, cfg, account):
+    curses.curs_set(0)
+    try:
+        curses.use_default_colors()
+        background = -1
+    except curses.error:
+        background = curses.COLOR_BLACK
+    curses.init_pair(1, curses.COLOR_CYAN, background)
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(3, curses.COLOR_WHITE, background)
+    if account is None:
+        account = choose_account(screen, cfg)
+        if account is None:
+            return
+    App(screen, cfg, account).run()
+
+
+def cli():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if args and args[0] == "add":
+        add_account_wizard()
+        return
+    if args and args[0] == "list":
+        list_accounts()
+        return
+    cfg = load_config()
+    accounts = cfg["accounts"]
+    if args and accounts:
+        wanted = slug(" ".join(args))
+        matches = [a for a in accounts if slug(a["name"]) == wanted] or \
+                  [a for a in accounts if slug(a["name"]).startswith(wanted)]
+        if not matches:
+            sys.exit(f"No hay ninguna lista '{' '.join(args)}'. Mira las que hay con:  lazyiptv list")
+        account = matches[0]
+    else:
+        account = accounts[0] if len(accounts) == 1 else None
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(main, cfg, account)
+
+
+if __name__ == "__main__":
+    cli()

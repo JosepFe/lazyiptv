@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """lazyiptv — navegador de IPTV en terminal, estilo lazygit.
 
-Grupos a la izquierda, canales a la derecha, Enter abre el canal en mpv.
-Reutiliza una única ventana de mpv (vía IPC) para no gastar conexiones.
+Tres pestañas (TV en directo, Películas, Series) con grupos, lista y ficha.
+Reproduce en una única ventana de mpv (vía IPC) para no gastar conexiones.
 Admite varias listas: cuentas Xtream Codes y listas M3U (enlace o archivo).
 
 Uso:
@@ -13,12 +13,15 @@ Uso:
 
 Funciona en Linux y en Windows (en Windows: pip install windows-curses, y mpv en el PATH).
 
-Linux:   ~/.config/lazyiptv/config.json            listas
-         ~/.config/lazyiptv/<lista>/favorites.json canales favoritos
-         ~/.config/lazyiptv/<lista>/groups.json    grupos fijados arriba
-         ~/.cache/lazyiptv/<lista>.json            caché (24 h, o 'r')
+Linux:   ~/.config/lazyiptv/config.json             listas
+         ~/.config/lazyiptv/<lista>/favorites.json  favoritos por pestaña
+         ~/.config/lazyiptv/<lista>/groups.json     grupos fijados por pestaña
+         ~/.config/lazyiptv/<lista>/history.json    vistos recientemente
+         ~/.cache/lazyiptv/<lista>-<pestaña>.json   caché (24 h, o 'r')
+         ~/.cache/lazyiptv/watch_later/             posiciones de "Seguir viendo" (mpv)
 Windows: lo mismo en %APPDATA%\\lazyiptv y %LOCALAPPDATA%\\lazyiptv
 """
+import hashlib
 import json
 import locale
 import os
@@ -28,6 +31,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import time
 import unicodedata
 import urllib.parse
@@ -50,31 +54,53 @@ else:
     MPV_IPC = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "lazyiptv-mpv.sock")
 
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+WATCH_LATER_DIR = os.path.join(CACHE_DIR, "watch_later")
 IPTVNATOR_DB = os.path.expanduser("~/.iptvnator/databases/iptvnator.db")
 USER_AGENT = "VLC/3.0"
 CACHE_MAX_AGE = 24 * 3600
+CACHE_VERSION = 2
+HISTORY_MAX = 200
+NEXT_EPISODES_MAX = 50
+WIDE = 110  # columnas a partir de las cuales se ve la ficha como tercera columna
 
-FAVS_ID = "__favs__"
-ALL_ID = "__all__"
+# Si el servidor corta la conexión (pasa a menudo en IPTV), reconectar en vez de cerrar mpv.
+# En directo también al "final", porque un directo no tiene final; en VOD no, o se quedaría colgado al acabar.
+LAVF_LIVE = "reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10"
+LAVF_VOD = "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10"
+MPV_ARGS = []  # argumentos extra para mpv (útil para pruebas)
+
+KINDS = ("live", "movie", "series")
+TAB_NAMES = {"live": "TV", "movie": "Películas", "series": "Series"}
+ALL_NAMES = {"live": "Todos los canales", "movie": "Todas las películas", "series": "Todas las series"}
+SORTS = {
+    "live": ["proveedor", "nombre"],
+    "movie": ["proveedor", "nombre", "año", "nota", "añadidas"],
+    "series": ["proveedor", "nombre", "año", "nota", "actualizadas"],
+}
+FAVS_ID, CONT_ID, RECENT_ID, ALL_ID = "__favs__", "__cont__", "__recent__", "__all__"
+SPECIAL = (FAVS_ID, CONT_ID, RECENT_ID, ALL_ID)
 
 HELP = [
     "lazyiptv — ayuda",
     "",
+    "  1 / 2 / 3       pestañas: TV · Películas · Series",
     "  j/k  ↑/↓        moverse",
     "  h/l  ←/→  Tab   cambiar de panel",
-    "  Enter           abrir grupo / reproducir canal",
+    "  Enter           abrir grupo · reproducir · ver episodios de una serie",
     "  g / G           ir al principio / al final",
     "  PgUp / PgDn     página arriba / abajo",
     "  /               filtrar el panel actual (Esc borra el filtro)",
-    "  f               en un canal: añadir/quitar de ★ Favoritos",
-    "                  en un grupo: fijarlo arriba / soltarlo",
+    "  s               buscar en todo (canales, películas y series)",
+    "  f               favorito: canal/película/serie → ★ Favoritos; grupo → fijado arriba",
+    "  o               cambiar el orden (nombre, año, nota, añadidas…)",
+    "  i               mostrar/ocultar la ficha (en ventanas estrechas)",
     "  a               cambiar de lista o añadir una nueva",
-    "  x               parar el reproductor",
-    "  r               recargar lista de canales del servidor",
+    "  x               parar el reproductor (guarda por dónde ibas)",
+    "  r               recargar la pestaña desde el servidor",
     "  q               salir (mpv sigue abierto)",
     "",
-    "  Consejo: en 'Todos los canales' el filtro busca en toda la lista.",
-    "  Para añadir listas: tecla a → '+ Añadir lista nueva' (o lazyiptv add)",
+    "  ▶ Seguir viendo: películas y episodios a medias; continúan donde lo dejaste.",
+    "  Los episodios siguientes se reproducen solos al acabar uno.",
     "",
     "  Pulsa cualquier tecla para volver.",
 ]
@@ -122,7 +148,7 @@ def write_config(cfg):
 def migrate_v1(old):
     """Formato antiguo (una sola cuenta en la raíz) → lista de cuentas.
 
-    Mueve favoritos, grupos fijados y caché a la carpeta de la cuenta.
+    Mueve favoritos y grupos fijados a la carpeta de la cuenta.
     """
     account = {"name": "Principal", "type": "xtream", **old}
     adir = account_dir(account)
@@ -131,9 +157,6 @@ def migrate_v1(old):
         src = os.path.join(CONFIG_DIR, fname)
         if os.path.exists(src):
             os.replace(src, os.path.join(adir, fname))
-    old_cache = os.path.join(CACHE_DIR, "live.json")
-    if os.path.exists(old_cache):
-        os.replace(old_cache, cache_file(account))
     return {"accounts": [account]}
 
 
@@ -155,23 +178,31 @@ def account_dir(account):
     return os.path.join(CONFIG_DIR, slug(account["name"]))
 
 
-def cache_file(account):
-    return os.path.join(CACHE_DIR, slug(account["name"]) + ".json")
-
-
-def load_list(path):
+def load_json(path, default):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
-        return []
+        return default
 
 
-def save_list(path, items):
+def save_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(items, f, indent=1, ensure_ascii=False)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
 
+
+def load_per_kind(path):
+    """{"live": [...], "movie": [...], "series": [...]}. Las versiones antiguas guardaban solo una lista (TV)."""
+    data = load_json(path, {})
+    if isinstance(data, list):
+        data = {"live": data}
+    return {kind: list(data.get(kind, [])) for kind in KINDS}
+
+
+# ---------- añadir listas ----------
 
 SOURCE_HELP = ("Pega el enlace M3U del proveedor, la dirección del servidor Xtream "
                "(http://servidor:puerto) o la ruta a un archivo .m3u")
@@ -211,8 +242,8 @@ def build_account(name, source, ask):
 
 
 def test_and_save(cfg, account):
-    """Descarga la lista para comprobar que funciona y la guarda. Devuelve los datos cargados."""
-    data = make_source(account).load_live(force=True)
+    """Descarga los canales para comprobar que funciona y guarda la lista. Devuelve los datos."""
+    data = make_source(account).load("live", force=True)
     cfg["accounts"].append(account)
     write_config(cfg)
     return data
@@ -236,7 +267,7 @@ def add_account_wizard():
         data = test_and_save(cfg, account)
     except Exception as exc:
         sys.exit(f"no funciona: {exc}")
-    print(f"OK, {len(data['streams'])} canales en {len(data['categories'])} grupos.")
+    print(f"OK, {len(data['items'])} canales en {len(data['categories'])} grupos.")
     print(f"Guardada. Ábrela con:  lazyiptv {slug(name)}")
 
 
@@ -251,58 +282,142 @@ def list_accounts():
 
 
 # ---------- fuentes ----------
+#
+# Todas las fuentes devuelven el mismo formato normalizado:
+#   categories: [{"id", "name"}]
+#   items:      [{"id", "name", "cat", ...}]   (+ year, rating, plot… en películas y series;
+#                                               + "url" si el elemento se reproduce tal cual)
 
 def http_get(url, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-class Source:
-    """Base: guarda en caché {"time", "categories", "streams"} con el formato de Xtream."""
+def to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
+
+def to_int(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def clean(value):
+    return str(value).strip() if value not in (None, "") else ""
+
+
+class Source:
     def __init__(self, account):
         self.account = account
-        self.cache = cache_file(account)
+        old = os.path.join(CACHE_DIR, slug(account["name"]) + ".json")  # caché de la versión 1
+        if os.path.exists(old):
+            os.remove(old)
 
-    def fetch(self):
-        raise NotImplementedError
+    def cache_path(self, kind):
+        return os.path.join(CACHE_DIR, f"{slug(self.account['name'])}-{kind}.json")
 
-    def stream_url(self, stream):
-        raise NotImplementedError
-
-    def load_live(self, force=False):
-        if not force and os.path.exists(self.cache):
-            with open(self.cache, encoding="utf-8") as f:
-                data = json.load(f)
-            if time.time() - data.get("time", 0) < CACHE_MAX_AGE:
+    def load(self, kind, force=False):
+        path = self.cache_path(kind)
+        if not force:
+            data = load_json(path, None)
+            if data and data.get("v") == CACHE_VERSION and time.time() - data.get("time", 0) < CACHE_MAX_AGE:
                 return data
-        categories, streams = self.fetch()
-        data = {"time": time.time(), "categories": categories, "streams": streams}
+        categories, items = self.fetch(kind)
+        data = {"v": CACHE_VERSION, "time": time.time(), "categories": categories, "items": items}
         os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(self.cache, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
         return data
+
+    def fetch(self, kind):
+        raise NotImplementedError
+
+    def episodes(self, series_id):
+        return []
+
+    def url(self, kind, item_id, ext=None):
+        raise NotImplementedError
 
 
 class XtreamSource(Source):
+    ACTIONS = {
+        "live": ("get_live_categories", "get_live_streams"),
+        "movie": ("get_vod_categories", "get_vod_streams"),
+        "series": ("get_series_categories", "get_series"),
+    }
+
     def api(self, **params):
         a = self.account
         query = urllib.parse.urlencode({"username": a["username"], "password": a["password"], **params})
-        with http_get(f"{a['server'].rstrip('/')}/player_api.php?{query}") as resp:
+        with http_get(f"{a['server'].rstrip('/')}/player_api.php?{query}", timeout=180) as resp:
             return json.load(resp)
 
-    def fetch(self):
-        return self.api(action="get_live_categories"), self.api(action="get_live_streams")
+    def fetch(self, kind):
+        cat_action, items_action = self.ACTIONS[kind]
+        categories = [{"id": str(c["category_id"]), "name": clean(c["category_name"])}
+                      for c in self.api(action=cat_action)]
+        items = []
+        for raw in self.api(action=items_action):
+            item = {"id": str(raw.get("series_id") if kind == "series" else raw["stream_id"]),
+                    "name": clean(raw.get("name")) or "?", "cat": str(raw.get("category_id"))}
+            if kind != "live":
+                item.update({
+                    "year": clean(raw.get("year")) or clean(raw.get("release_date") or raw.get("releaseDate"))[:4],
+                    "rating": to_float(raw.get("rating")),
+                    "added": to_int(raw.get("added") if kind == "movie" else raw.get("last_modified")),
+                    "genre": clean(raw.get("genre")),
+                    "plot": clean(raw.get("plot")),
+                    "cast": clean(raw.get("cast")),
+                    "director": clean(raw.get("director")),
+                    "duration": to_int(raw.get("episode_run_time")),
+                })
+            if kind == "movie":
+                item["ext"] = clean(raw.get("container_extension")) or "mp4"
+            items.append(item)
+        return categories, items
 
-    def stream_url(self, stream):
+    def episodes(self, series_id):
+        info = self.api(action="get_series_info", series_id=series_id)
+        episodes = info.get("episodes") or {}
+        if isinstance(episodes, list):  # algunos paneles devuelven una lista de temporadas
+            episodes = {str(i + 1): season for i, season in enumerate(episodes)}
+        result = []
+        for season, eps in episodes.items():
+            for ep in eps or []:
+                details = ep.get("info") or {}
+                if not isinstance(details, dict):
+                    details = {}
+                result.append({
+                    "id": str(ep["id"]), "season": to_int(ep.get("season") or season),
+                    "num": to_int(ep.get("episode_num")), "title": clean(ep.get("title")),
+                    "ext": clean(ep.get("container_extension")) or "mp4",
+                    "plot": clean(details.get("plot")), "duration": clean(details.get("duration")),
+                })
+        result.sort(key=lambda e: (e["season"], e["num"]))
+        return result
+
+    def url(self, kind, item_id, ext=None):
         a = self.account
-        return f"{a['server'].rstrip('/')}/live/{a['username']}/{a['password']}/{stream['stream_id']}.ts"
+        base = f"{a['server'].rstrip('/')}"
+        path = {"live": "live", "movie": "movie", "episode": "series"}[kind]
+        return f"{base}/{path}/{a['username']}/{a['password']}/{item_id}.{ext or 'ts'}"
 
 
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 
 
 class M3USource(Source):
+    """Lista M3U. Películas y series se reconocen por /movie/ y /series/ en la URL (formato Xtream)."""
+
+    def __init__(self, account):
+        super().__init__(account)
+        self._parsed = None
+
     def lines(self):
         url = self.account["url"]
         if os.path.exists(url):
@@ -313,8 +428,12 @@ class M3USource(Source):
                 for raw in resp:
                     yield raw.decode("utf-8", errors="replace")
 
-    def fetch(self):
-        groups, streams, info = {}, [], None
+    def parse(self):
+        if self._parsed is not None:
+            return self._parsed
+        groups = {kind: {} for kind in KINDS}
+        items = {kind: [] for kind in KINDS}
+        info = None
         for line in self.lines():
             line = line.strip()
             if line.startswith("#EXTINF"):
@@ -323,16 +442,21 @@ class M3USource(Source):
                 attrs = dict(ATTR_RE.findall(info))
                 rest = ATTR_RE.sub("", info)
                 name = rest.split(",", 1)[1].strip() if "," in rest else attrs.get("tvg-name", "?")
+                kind = "movie" if "/movie/" in line else "series" if "/series/" in line else "live"
                 group = attrs.get("group-title") or "Sin grupo"
-                cid = groups.setdefault(group, str(len(groups) + 1))
-                # el id es la URL: así favoritos siguen valiendo aunque la lista cambie de orden
-                streams.append({"stream_id": line, "name": name or "?", "category_id": cid})
+                cid = groups[kind].setdefault(group, str(len(groups[kind]) + 1))
+                # el id es la URL: así los favoritos siguen valiendo aunque la lista cambie de orden
+                items[kind].append({"id": line, "name": name or "?", "cat": cid, "url": line})
                 info = None
-        categories = [{"category_id": cid, "category_name": g} for g, cid in groups.items()]
-        return categories, streams
+        self._parsed = {kind: ([{"id": cid, "name": g} for g, cid in groups[kind].items()], items[kind])
+                        for kind in KINDS}
+        return self._parsed
 
-    def stream_url(self, stream):
-        return stream["stream_id"]
+    def fetch(self, kind):
+        return self.parse()[kind]
+
+    def url(self, kind, item_id, ext=None):
+        return item_id
 
 
 def make_source(account):
@@ -341,57 +465,132 @@ def make_source(account):
 
 # ---------- reproductor ----------
 
-def mpv_send(command):
-    """Envía un comando JSON al mpv abierto. Devuelve False si no hay mpv escuchando."""
-    payload = (json.dumps({"command": command}) + "\n").encode()
+def mpv_request(command, reply=False):
+    """Envía un comando al mpv de lazyiptv.
+
+    Devuelve None si no hay mpv escuchando; si reply=True, la respuesta (dict); si no, True.
+    """
+    payload = (json.dumps({"command": command, "request_id": 1}) + "\n").encode()
     try:
         if WINDOWS:
             with open(MPV_IPC, "r+b", buffering=0) as pipe:
                 pipe.write(payload)
+                while reply:
+                    msg = json.loads(pipe.readline() or b"{}")
+                    if msg.get("request_id") == 1 or not msg:
+                        return msg
         else:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(1)
+                sock.settimeout(2)
                 sock.connect(MPV_IPC)
                 sock.sendall(payload)
+                if reply:
+                    buf = b""
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            return {}
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            msg = json.loads(line)
+                            if msg.get("request_id") == 1:
+                                return msg
         return True
-    except OSError:
-        return False
-
-
-def play(url, title):
-    """Abre la URL en el mpv de lazyiptv. Devuelve un mensaje de error o None."""
-    if mpv_send(["loadfile", url, "replace"]):
-        mpv_send(["set_property", "force-media-title", title])
+    except (OSError, ValueError):
         return None
-    mpv = shutil.which("mpv")
-    if not mpv:
-        return "No encuentro mpv. Instálalo y asegúrate de que está en el PATH."
-    detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
-              if WINDOWS else {"start_new_session": True})
-    subprocess.Popen(
-        [mpv, f"--input-ipc-server={MPV_IPC}", f"--user-agent={USER_AGENT}",
-         f"--force-media-title={title}", "--cache=yes", "--demuxer-max-bytes=50MiB",
-         # si el servidor corta la conexión (pasa a menudo en IPTV), reconectar en vez de cerrar mpv
-         "--stream-lavf-o=reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,"
-         "reconnect_on_network_error=1,reconnect_delay_max=10", url],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **detach,
-    )
+
+
+def is_vod(url):
+    return bool(url) and ("/movie/" in url or "/series/" in url)
+
+
+def file_options(entry):
+    opts = {"force-media-title": entry["title"]}
+    if entry["live"]:
+        # en directo no tiene sentido guardar ni reanudar la posición
+        opts.update({"stream-lavf-o": LAVF_LIVE, "resume-playback": "no", "save-position-on-quit": "no"})
+    else:
+        opts["stream-lavf-o"] = LAVF_VOD
+    return opts
+
+
+def play(entries):
+    """Reproduce entries[0] y deja el resto en cola. entries: [{"url", "title", "live"}].
+
+    Devuelve un mensaje de error o None.
+    """
+    os.makedirs(WATCH_LATER_DIR, exist_ok=True)
+    current = mpv_request(["get_property", "path"], reply=True)
+    if current is None:
+        mpv = shutil.which("mpv")
+        if not mpv:
+            return "No encuentro mpv. Instálalo y asegúrate de que está en el PATH."
+        detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+                  if WINDOWS else {"start_new_session": True})
+        subprocess.Popen(
+            [mpv, "--idle=once", f"--input-ipc-server={MPV_IPC}", f"--user-agent={USER_AGENT}",
+             "--cache=yes", "--demuxer-max-bytes=50MiB", "--save-position-on-quit",
+             f"--watch-later-dir={WATCH_LATER_DIR}", *MPV_ARGS],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, **detach,
+        )
+        for _ in range(100):
+            time.sleep(0.05)
+            if mpv_request(["get_property", "idle-active"], reply=True) is not None:
+                break
+        else:
+            return "mpv no ha arrancado."
+    else:
+        # guardar por dónde ibas antes de cambiar, si lo que suena es una película o episodio
+        if is_vod(current.get("data")):
+            mpv_request(["write-watch-later-config"])
+        # por si este mpv lo abrió una versión anterior de lazyiptv
+        mpv_request(["set_property", "watch-later-dir", WATCH_LATER_DIR])
+        mpv_request(["set_property", "save-position-on-quit", True])
+    for i, entry in enumerate(entries):
+        mpv_request({"name": "loadfile", "url": entry["url"], "flags": "replace" if i == 0 else "append",
+                     "options": file_options(entry)})
     return None
 
 
 def stop():
-    return mpv_send(["quit"])
+    return mpv_request(["quit"]) is not None
+
+
+def watch_position(url):
+    """Segundos guardados por mpv para esta URL (watch later), o None."""
+    path = os.path.join(WATCH_LATER_DIR, hashlib.md5(url.encode()).hexdigest().upper())
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("start="):
+                    return to_float(line[6:])
+    except OSError:
+        pass
+    return None
+
+
+def fmt_time(seconds):
+    seconds = int(seconds)
+    h, rest = divmod(seconds, 3600)
+    return f"{h}:{rest // 60:02}:{rest % 60:02}" if h else f"{rest // 60}:{rest % 60:02}"
 
 
 # ---------- utilidades de texto ----------
 
+def char_width(ch):
+    if unicodedata.category(ch) in ("Cc", "Cf", "Mn"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
 def clip(text, width):
-    """Recorta respetando caracteres anchos (emojis, CJK) para no romper el layout."""
+    """Recorta respetando caracteres anchos (emojis, CJK) y rellena hasta `width`."""
     out, used = [], 0
     for ch in text:
-        if unicodedata.category(ch) in ("Cc", "Cf"):
+        w = char_width(ch)
+        if w == 0 and unicodedata.category(ch) != "Mn":
             continue
-        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
         if used + w > width:
             break
         out.append(ch)
@@ -404,25 +603,61 @@ def normalize(text):
     return "".join(c for c in text if not unicodedata.combining(c))
 
 
+def wrap(text, width):
+    return textwrap.wrap(text, max(10, width)) if text else []
+
+
 # ---------- interfaz ----------
 
 class Pane:
-    def __init__(self, title):
+    def __init__(self, title=""):
         self.title = title
-        self.items = []      # lista de (id, etiqueta)
-        self.filter = ""
+        self._items = []     # lista de (id, etiqueta)
+        self._norms = None   # etiquetas normalizadas, calculadas al filtrar por primera vez
+        self._filter = ""
+        self._visible = None
         self.cursor = 0
         self.top = 0
 
+    @property
+    def items(self):
+        return self._items
+
+    def set_items(self, items, keep=None):
+        self._items, self._norms, self._visible = items, None, None
+        self.reset()
+        if keep is not None:
+            self.select(keep)
+
+    @property
+    def filter(self):
+        return self._filter
+
+    @filter.setter
+    def filter(self, value):
+        self._filter, self._visible = value, None
+
     def visible(self):
-        if not self.filter:
-            return self.items
-        words = normalize(self.filter).split()
-        return [it for it in self.items if all(w in normalize(it[1]) for w in words)]
+        if self._visible is None:
+            if not self._filter:
+                self._visible = self._items
+            else:
+                if self._norms is None:
+                    self._norms = [normalize(label) for _, label in self._items]
+                words = normalize(self._filter).split()
+                self._visible = [it for it, n in zip(self._items, self._norms) if all(w in n for w in words)]
+        return self._visible
 
     def selected(self):
         vis = self.visible()
-        return vis[self.cursor] if vis else None
+        return vis[self.cursor] if vis and self.cursor < len(vis) else None
+
+    def select(self, item_id):
+        for i, (iid, _) in enumerate(self.visible()):
+            if iid == item_id:
+                self.cursor = i
+                return True
+        return False
 
     def move(self, delta):
         n = len(self.visible())
@@ -432,81 +667,199 @@ class Pane:
         self.cursor = self.top = 0
 
 
+class SearchPane(Pane):
+    """Como Pane, pero ordena los resultados: primero los títulos que empiezan por lo buscado."""
+
+    def __init__(self, title=""):
+        super().__init__(title)
+        self.names = {}  # id → nombre normalizado (sin etiqueta ni grupo)
+
+    def visible(self):
+        if self._visible is None:
+            vis = super().visible()
+            query = normalize(self._filter).strip()
+            if query:
+                def rank(item):
+                    # 0: empieza por lo buscado · 1: alguna palabra empieza por ello · 2: lo contiene;
+                    # a igualdad, el título más corto (el más parecido a lo buscado)
+                    name = self.names.get(item[0], "")
+                    level = 0 if name.startswith(query) else 1 if f" {query}" in f" {name}" else 2
+                    return level, len(name)
+                vis = sorted(vis, key=rank)
+            self._visible = vis
+        return self._visible
+
+
+class Tab:
+    def __init__(self, kind):
+        self.kind = kind
+        self.groups = Pane("Grupos")
+        self.items = Pane(TAB_NAMES[kind])
+        self.episodes = Pane("Episodios")
+        self.focus = "groups"
+        self.sort = 0
+        self.open_series = None  # id de la serie cuyos episodios están cargados
+
+    def pane(self, name=None):
+        return getattr(self, name or self.focus)
+
+
 class App:
     def __init__(self, screen, cfg, account):
         self.screen = screen
         self.cfg = cfg
-        self.groups = Pane("Grupos")
-        self.channels = Pane("Canales")
-        self.focus = self.groups
         self.status = ""
         self.playing = ""
         self.typing = False
+        self.show_info = False
+        self.mode = "browse"  # o "search"
+        self.search = SearchPane("Buscar en todo")
         self.open_account(account)
 
-    # datos
+    # ----- datos -----
     def open_account(self, account):
         self.account = account
         self.source = make_source(account)
         adir = account_dir(account)
         self.favs_file = os.path.join(adir, "favorites.json")
         self.groups_file = os.path.join(adir, "groups.json")
-        self.favs = set(load_list(self.favs_file))
-        self.pinned = load_list(self.groups_file)  # ids de grupo, en el orden en que se fijaron
-        self.groups.filter = self.channels.filter = ""
-        self.focus = self.groups
-        self.load(force=False)
+        self.history_file = os.path.join(adir, "history.json")
+        self.favs = load_per_kind(self.favs_file)
+        self.pinned = load_per_kind(self.groups_file)  # ids de grupo, en el orden en que se fijaron
+        self.history = load_json(self.history_file, [])
+        self.data = {kind: None for kind in KINDS}
+        self.episode_cache = {}  # series_id → episodios
+        self.entries = {}        # id → entrada de historial (para Recientes / Seguir viendo)
+        self.tabs = {kind: Tab(kind) for kind in KINDS}
+        self.tab = self.tabs["live"]
+        self.mode = "browse"
+        self.ensure_loaded("live")
 
-    def load(self, force):
-        self.message(f"Cargando {self.account['name']}…")
-        self.status = ""
+    def ensure_loaded(self, kind, force=False):
+        if self.data[kind] is not None and not force:
+            return True
+        what = {"live": "canales", "movie": "películas", "series": "series"}[kind]
+        self.message(f"Cargando {what} de {self.account['name']}…")
         try:
-            data = self.source.load_live(force=force)
+            raw = self.source.load(kind, force=force)
         except Exception as exc:  # red caída, credenciales mal, etc.
-            self.status = f"Error cargando canales: {exc}"
-            data = {"categories": [], "streams": []}
-        self.streams = data["streams"]
-        self.by_id = {str(s["stream_id"]): s for s in self.streams}
-        self.by_cat = {}
-        for s in self.streams:
-            self.by_cat.setdefault(str(s.get("category_id")), []).append(s)
-        self.categories = data["categories"]
-        self.build_groups()
-        self.groups.reset()
-        self.fill_channels()
-        if not self.status:
-            self.status = f"{len(self.streams)} canales en {len(data['categories'])} grupos"
-
-    def build_groups(self):
-        """Favoritos, luego los grupos fijados (en su orden), luego Todos y el resto."""
-        labels = {
-            str(c["category_id"]): f"{c['category_name'].strip()} ({len(self.by_cat.get(str(c['category_id']), []))})"
-            for c in self.categories
-        }
-        pinned = [gid for gid in self.pinned if gid in labels]
-        self.groups.items = [(FAVS_ID, "★ Favoritos")]
-        self.groups.items += [(gid, labels[gid]) for gid in pinned]
-        self.groups.items.append((ALL_ID, f"Todos los canales ({len(self.streams)})"))
-        self.groups.items += [(gid, label) for gid, label in labels.items() if gid not in pinned]
-
-    def fill_channels(self):
-        group = self.groups.selected()
-        if not group:
-            self.channels.items = []
+            self.status = f"Error cargando {what}: {exc}"
+            raw = {"categories": [], "items": []}
+            ok = False
         else:
-            gid = group[0]
-            if gid == FAVS_ID:
-                streams = [self.by_id[i] for i in sorted(self.favs) if i in self.by_id]
-            elif gid == ALL_ID:
-                streams = self.streams
-            else:
-                streams = self.by_cat.get(gid, [])
-            self.channels.items = [(str(s["stream_id"]), s["name"].strip()) for s in streams]
-            self.channels.title = group[1]
-        self.channels.filter = ""
-        self.channels.reset()
+            self.status = f"{len(raw['items'])} {what} en {len(raw['categories'])} grupos"
+            ok = True
+        by_cat = {}
+        for item in raw["items"]:
+            by_cat.setdefault(item["cat"], []).append(item)
+        self.data[kind] = {"categories": raw["categories"], "items": raw["items"],
+                           "by_id": {it["id"]: it for it in raw["items"]}, "by_cat": by_cat}
+        tab = self.tabs[kind]
+        keep = tab.groups.selected()
+        self.build_groups(tab, keep[0] if keep else None)
+        return ok
 
-    # dibujo
+    def build_groups(self, tab, keep=None):
+        kind, data = tab.kind, self.data[tab.kind]
+        labels = {c["id"]: f"{c['name']} ({len(data['by_cat'].get(c['id'], []))})" for c in data["categories"]}
+        pinned = [gid for gid in self.pinned[kind] if gid in labels]
+        items = [(FAVS_ID, "★ Favoritos")]
+        if kind != "live":
+            items.append((CONT_ID, "▶ Seguir viendo"))
+        items.append((RECENT_ID, "◷ Recientes"))
+        items += [(gid, labels[gid]) for gid in pinned]
+        items.append((ALL_ID, f"{ALL_NAMES[kind]} ({len(data['items'])})"))
+        items += [(gid, label) for gid, label in labels.items() if gid not in pinned]
+        tab.groups.set_items(items, keep=keep)
+        self.fill_items(tab)
+
+    def item_label(self, kind, item):
+        label = item["name"]
+        if item.get("rating"):
+            label += f"  · {item['rating']:.1f}"
+        return label
+
+    def sort_items(self, tab, items):
+        mode = SORTS[tab.kind][tab.sort]
+        if mode == "nombre":
+            return sorted(items, key=lambda it: normalize(it["name"]))
+        if mode == "año":
+            return sorted(items, key=lambda it: it.get("year") or "", reverse=True)
+        if mode == "nota":
+            return sorted(items, key=lambda it: it.get("rating") or 0, reverse=True)
+        if mode in ("añadidas", "actualizadas"):
+            return sorted(items, key=lambda it: it.get("added") or 0, reverse=True)
+        return items
+
+    def history_items(self, kind, only_resumable):
+        pairs = []
+        for entry in self.history:
+            if entry["kind"] != kind:
+                continue
+            label = entry["name"]
+            if only_resumable:
+                pos = watch_position(self.entry_url(entry))
+                if not pos:
+                    continue
+                label += f"  ⏵ {fmt_time(pos)}"
+            self.entries[entry["id"]] = entry
+            pairs.append((entry["id"], label))
+        return pairs
+
+    def fill_items(self, tab, keep=None):
+        group = tab.groups.selected()
+        kind, data = tab.kind, self.data[tab.kind]
+        title = TAB_NAMES[kind]
+        pairs = []
+        if group:
+            gid, title = group
+            if gid == FAVS_ID:
+                items = [data["by_id"][i] for i in self.favs[kind] if i in data["by_id"]]
+                pairs = [(it["id"], self.item_label(kind, it)) for it in self.sort_items(tab, items)]
+            elif gid == RECENT_ID:
+                pairs = self.history_items(kind, only_resumable=False)
+            elif gid == CONT_ID:
+                pairs = self.history_items(kind, only_resumable=True)
+            else:
+                items = data["items"] if gid == ALL_ID else data["by_cat"].get(gid, [])
+                pairs = [(it["id"], self.item_label(kind, it)) for it in self.sort_items(tab, items)]
+            if gid not in (RECENT_ID, CONT_ID) and SORTS[kind][tab.sort] != "proveedor":
+                title += f" · orden: {SORTS[kind][tab.sort]}"
+        tab.items.title = title
+        tab.items.filter = ""
+        tab.items.set_items(pairs, keep=keep)
+
+    def find(self, kind, item_id):
+        data = self.data[kind]
+        if data and item_id in data["by_id"]:
+            return data["by_id"][item_id]
+        return self.entries.get(item_id)
+
+    def entry_url(self, entry):
+        """URL de una entrada de historial (no se guardan URLs con credenciales en el historial)."""
+        if self.account["type"] != "xtream":
+            return entry.get("eid") or entry["id"]
+        if entry.get("eid"):
+            return self.source.url("episode", entry["eid"], entry.get("ext"))
+        return self.source.url(entry["kind"], entry["id"], entry.get("ext"))
+
+    def remember(self, entry):
+        entry = {**entry, "t": int(time.time())}
+        self.history = [entry] + [h for h in self.history if h["id"] != entry["id"]]
+        del self.history[HISTORY_MAX:]
+        save_json(self.history_file, self.history)
+
+    def load_episodes(self, series_id):
+        if series_id not in self.episode_cache:
+            self.message("Cargando episodios…")
+            try:
+                self.episode_cache[series_id] = self.source.episodes(series_id)
+            except Exception as exc:
+                self.status = f"Error cargando episodios: {exc}"
+                return []
+        return self.episode_cache[series_id]
+
+    # ----- dibujo -----
     def message(self, text):
         h, w = self.screen.getmaxyx()
         self.screen.erase()
@@ -516,16 +869,26 @@ class App:
             pass
         self.screen.refresh()
 
-    def draw_pane(self, pane, y, x, h, w, title=None):
-        active = pane is self.focus
-        border = curses.color_pair(1) | curses.A_BOLD if active else curses.color_pair(3)
+    def border_attr(self, active):
+        return curses.color_pair(1) | curses.A_BOLD if active else curses.color_pair(3)
+
+    def draw_box(self, y, x, h, w, title, active):
         win = self.screen.derwin(h, w, y, x)
-        win.attrset(border)
+        attr = self.border_attr(active)
+        win.attrset(attr)
         win.box()
-        title = f" {title or pane.title} "
-        if pane.filter or (self.typing and active):
-            title += f"/ {pane.filter}{'▏' if self.typing and active else ''} "
-        win.addstr(0, 2, clip(title, w - 4).rstrip(), border)
+        try:
+            win.addstr(0, 2, clip(f" {title} ", w - 4).rstrip(), attr)
+        except curses.error:
+            pass
+        return win
+
+    def draw_pane(self, pane, y, x, h, w, title, active, stars=(), empty="(vacío)"):
+        if self.typing and active:
+            title += f" / {pane.filter}▏"
+        elif pane.filter:
+            title += f" / {pane.filter}"
+        win = self.draw_box(y, x, h, w, title, active)
         vis = pane.visible()
         rows = h - 2
         if pane.cursor < pane.top:
@@ -534,8 +897,7 @@ class App:
             pane.top = pane.cursor - rows + 1
         for i, (iid, label) in enumerate(vis[pane.top:pane.top + rows]):
             idx = pane.top + i
-            starred = iid in (self.favs if pane is self.channels else self.pinned)
-            mark = "★ " if starred else "  "
+            mark = "★ " if iid in stars else "  "
             attr = curses.A_NORMAL
             if idx == pane.cursor:
                 attr = curses.color_pair(2) | curses.A_BOLD if active else curses.A_REVERSE
@@ -544,30 +906,158 @@ class App:
             except curses.error:
                 pass
         if not vis:
-            win.addstr(1, 2, clip("(vacío)", w - 4), curses.A_DIM)
+            try:
+                win.addstr(1, 2, clip(empty, w - 4), curses.A_DIM)
+            except curses.error:
+                pass
         count = f" {pane.cursor + 1 if vis else 0}/{len(vis)} "
         try:
-            win.addstr(h - 1, max(1, w - len(count) - 2), count, border)
+            win.addstr(h - 1, max(1, w - len(count) - 2), count, self.border_attr(active))
         except curses.error:
             pass
+
+    def info_lines(self, kind, item, width):
+        """Líneas (texto, atributo) de la ficha de una película o serie."""
+        if not item:
+            return []
+        lines = [(item["name"], curses.A_BOLD)]
+        meta = [item.get("year"), item.get("genre")]
+        if item.get("rating"):
+            meta.append(f"★ {item['rating']:.1f}")
+        if item.get("duration"):
+            meta.append(f"{item['duration'] // 60}h {item['duration'] % 60:02}m" if item["duration"] >= 60
+                        else f"{item['duration']} min")
+        meta = " · ".join(m for m in meta if m)
+        if meta:
+            lines += [(line, curses.color_pair(1)) for line in wrap(meta, width)]
+        if item.get("director"):
+            lines += [(line, curses.A_NORMAL) for line in wrap(f"Dirección: {item['director']}", width)]
+        if item.get("cast"):
+            lines += [(line, curses.A_NORMAL) for line in wrap(f"Reparto: {item['cast']}", width)[:3]]
+        if item.get("added"):
+            word = "Añadida" if kind == "movie" else "Actualizada"
+            lines.append((f"{word} el {time.strftime('%d/%m/%Y', time.localtime(item['added']))}", curses.A_DIM))
+        if item.get("plot"):
+            lines.append(("", 0))
+            lines += [(line, curses.A_NORMAL) for line in wrap(item["plot"], width)]
+        if kind == "series" and not item.get("url") and not item.get("eid"):
+            lines += [("", 0), ("Enter: ver temporadas y episodios", curses.A_DIM)]
+        return lines
+
+    def draw_info(self, kind, item, y, x, h, w):
+        win = self.draw_box(y, x, h, w, "Ficha", False)
+        for i, (text, attr) in enumerate(self.info_lines(kind, item, w - 4)[:h - 2]):
+            try:
+                win.addstr(1 + i, 2, clip(text, w - 4), attr)
+            except curses.error:
+                pass
+
+    def draw_tabs(self, w):
+        x = 1
+        for i, kind in enumerate(KINDS):
+            label = f" {i + 1} {TAB_NAMES[kind]} "
+            current = self.mode == "browse" and self.tab.kind == kind
+            attr = curses.color_pair(2) | curses.A_BOLD if current else curses.A_DIM
+            try:
+                self.screen.addstr(0, x, label, attr)
+            except curses.error:
+                pass
+            x += len(label) + 1
+        search = " s Buscar en todo "
+        attr = curses.color_pair(2) | curses.A_BOLD if self.mode == "search" else curses.A_DIM
+        right = f"{self.account['name']} "
+        try:
+            self.screen.addstr(0, x + 1, search, attr)
+            self.screen.addstr(0, max(x + len(search) + 3, w - len(right) - 1), right, curses.color_pair(1))
+        except curses.error:
+            pass
+
+    def selected_item(self):
+        """(tipo, elemento) bajo el cursor, para la ficha."""
+        if self.mode == "search":
+            sel = self.search.selected()
+            if not sel:
+                return None, None
+            kind, iid = sel[0].split("|", 1)
+            return kind, self.find(kind, iid)
+        tab = self.tab
+        sel = tab.items.selected()
+        return tab.kind, (self.find(tab.kind, sel[0]) if sel else None)
 
     def draw(self):
         self.screen.erase()
         h, w = self.screen.getmaxyx()
-        if h < 8 or w < 40:
+        if h < 10 or w < 50:
             self.message("Ventana demasiado pequeña")
             return
-        left = max(24, w // 3)
-        self.draw_pane(self.groups, 0, 0, h - 2, left, f"{self.account['name']} · Grupos")
-        self.draw_pane(self.channels, 0, left, h - 2, w - left)
+        self.draw_tabs(w)
+        top, body = 1, h - 3
+        wide = w >= WIDE
+        if self.mode == "search":
+            self.draw_search(top, body, w, wide)
+        else:
+            self.draw_browse(top, body, w, wide)
         playing = f"▶ {self.playing}   " if self.playing else ""
         try:
             self.screen.addstr(h - 2, 1, clip(playing + self.status, w - 2), curses.color_pair(1))
-            keys = "Enter abrir · / filtrar · f favorito · a lista · x parar · r recargar · ? ayuda · q salir"
-            self.screen.addstr(h - 1, 1, clip(keys, w - 2), curses.A_DIM)
+            self.screen.addstr(h - 1, 1, clip(self.hint(), w - 2), curses.A_DIM)
         except curses.error:
             pass
         self.screen.refresh()
+
+    def draw_browse(self, top, body, w, wide):
+        tab = self.tab
+        kind = tab.kind
+        groups_title = f"{TAB_NAMES[kind]} · Grupos"
+        stars = set(self.favs[kind])
+        if kind == "live":
+            left = max(24, w // 3)
+            self.draw_pane(tab.groups, top, 0, body, left, groups_title, tab.focus == "groups", set(self.pinned[kind]))
+            self.draw_pane(tab.items, top, left, body, w - left, tab.items.title, tab.focus == "items", stars)
+            return
+        left = max(22, w // 4)
+        self.draw_pane(tab.groups, top, 0, body, left, groups_title, tab.focus == "groups", set(self.pinned[kind]))
+        sel = tab.items.selected()
+        showing_episodes = kind == "series" and tab.open_series and sel and sel[0] == tab.open_series
+        if wide:
+            mid = max(30, (w - left) * 5 // 11)
+            self.draw_pane(tab.items, top, left, body, mid, tab.items.title, tab.focus == "items", stars)
+            x, rw = left + mid, w - left - mid
+        else:
+            x, rw = left, w - left
+            if not (tab.focus == "episodes" or self.show_info):
+                self.draw_pane(tab.items, top, left, body, rw, tab.items.title, tab.focus == "items", stars)
+                return
+        if showing_episodes:
+            name = self.find(kind, tab.open_series)["name"]
+            self.draw_pane(tab.episodes, top, x, body, rw, f"{name} · Episodios", tab.focus == "episodes",
+                           empty="(sin episodios)")
+        else:
+            self.draw_info(*self.selected_item(), top, x, body, rw)
+
+    def draw_search(self, top, body, w, wide):
+        rw = w * 2 // 5 if wide or self.show_info else 0
+        empty = "Escribe al menos 2 letras" if len(self.search.filter) < 2 else "Sin resultados"
+        stars = {f"{k}|{i}" for k in KINDS for i in self.favs[k]}
+        if len(self.search.filter) < 2:
+            hold = self.search._visible
+            self.search._visible = []
+            self.draw_pane(self.search, top, 0, body, w - rw, "Buscar en todo", True, stars, empty)
+            self.search._visible = hold
+        else:
+            self.draw_pane(self.search, top, 0, body, w - rw, "Buscar en todo", True, stars, empty)
+        if rw:
+            self.draw_info(*self.selected_item(), top, w - rw, body, rw)
+
+    def hint(self):
+        if self.typing:
+            return "Escribe para filtrar · Enter terminar · Esc borrar"
+        if self.mode == "search":
+            return "Enter abrir · / escribir · f favorito · Esc volver · q salir"
+        common = "f favorito · o orden · s buscar · a lista · x parar · ? ayuda · q salir"
+        if self.tab.focus == "episodes":
+            return "Enter reproducir (y siguientes) · h volver · " + common
+        return "1-3 pestañas · Enter abrir · / filtrar · " + common
 
     def show_help(self):
         self.screen.erase()
@@ -579,19 +1069,197 @@ class App:
         self.screen.refresh()
         self.screen.get_wch()
 
-    # acciones
-    def activate(self):
-        if self.focus is self.groups:
-            self.focus = self.channels
+    # ----- acciones -----
+    def switch_tab(self, kind):
+        self.mode = "browse"
+        self.tab = self.tabs[kind]
+        self.ensure_loaded(kind)
+        # "Seguir viendo" y "Recientes" cambian al ver cosas: refrescar al volver
+        group = self.tab.groups.selected()
+        if group and group[0] in (CONT_ID, RECENT_ID, FAVS_ID):
+            sel = self.tab.items.selected()
+            self.fill_items(self.tab, keep=sel[0] if sel else None)
+
+    def open_series(self, series_id):
+        tab = self.tabs["series"]
+        episodes = self.load_episodes(series_id)
+        name = self.find("series", series_id)["name"]
+        labels = []
+        for ep in episodes:
+            # "Serie (2008) - S02E01 - Título" → "Título"; sin título → "Episodio 1"
+            title = re.sub(r"^.*\b[ST]\d+\s*E\d+\b\s*[-–:]?\s*", "", ep["title"], flags=re.I).strip()
+            title = title or f"Episodio {ep['num']}"
+            label = f"T{ep['season']} · E{ep['num']:02} · {title}"
+            pos = watch_position(self.source.url("episode", ep["id"], ep["ext"]))
+            if pos:
+                label += f"  ⏵ {fmt_time(pos)}"
+            labels.append((ep["id"], label))
+        tab.open_series = series_id
+        tab.episodes.filter = ""
+        tab.episodes.set_items(labels)
+        # empezar por el último episodio a medias, si lo hay
+        for entry in self.history:
+            if entry.get("sid") == series_id and tab.episodes.select(entry["eid"]):
+                break
+        tab.focus = "episodes"
+        self.status = f"{name}: {len(episodes)} episodios"
+
+    def play_episode(self, series_id, episode_id):
+        episodes = self.load_episodes(series_id)
+        idx = next((i for i, ep in enumerate(episodes) if ep["id"] == episode_id), None)
+        if idx is None:
+            self.status = "No encuentro ese episodio."
             return
-        item = self.channels.selected()
-        if item:
-            error = play(self.source.stream_url(self.by_id[item[0]]), item[1])
-            if error:
-                self.status = error
+        name = self.find("series", series_id)
+        name = name["name"].split(" · ")[0] if name else ""
+        queue = []
+        for ep in episodes[idx:idx + NEXT_EPISODES_MAX]:
+            queue.append({"url": self.source.url("episode", ep["id"], ep["ext"]),
+                          "title": f"{name} · T{ep['season']}E{ep['num']:02}", "live": False})
+        ep = episodes[idx]
+        self.remember({"kind": "series", "id": f"ep|{series_id}|{ep['id']}", "sid": series_id, "eid": ep["id"],
+                       "ext": ep["ext"], "name": f"{name} · T{ep['season']}E{ep['num']:02}"})
+        self.start(queue)
+
+    def start(self, queue):
+        error = play(queue)
+        if error:
+            self.status = error
+        else:
+            self.playing = queue[0]["title"]
+            more = f" (+{len(queue) - 1} en cola)" if len(queue) > 1 else ""
+            self.status = f"Abriendo en mpv…{more}"
+
+    def activate(self, kind, item_id):
+        """Enter sobre un elemento: reproducir, o abrir los episodios de una serie."""
+        item = self.find(kind, item_id)
+        if not item:
+            return
+        if item.get("eid"):  # episodio guardado en Recientes / Seguir viendo
+            if self.account["type"] == "xtream":
+                self.play_episode(item["sid"], item["eid"])
             else:
-                self.playing = item[1]
-                self.status = "Abriendo en mpv…"
+                self.remember(item)
+                self.start([{"url": self.entry_url(item), "title": item["name"], "live": False}])
+            return
+        if kind == "series" and not item.get("url"):
+            self.open_series(item_id)
+            return
+        url = item.get("url") or self.source.url(kind, item_id, item.get("ext"))
+        self.remember({"kind": kind, "id": item_id, "name": item["name"], "ext": item.get("ext")})
+        self.start([{"url": url, "title": item["name"], "live": kind == "live"}])
+
+    def enter(self):
+        if self.mode == "search":
+            sel = self.search.selected()
+            if not sel:
+                return
+            kind, iid = sel[0].split("|", 1)
+            item = self.find(kind, iid)
+            if kind == "series" and item and not item.get("url"):
+                self.jump_to_series(iid)
+            else:
+                self.activate(kind, iid)
+            return
+        tab = self.tab
+        if tab.focus == "groups":
+            tab.focus = "items"
+        elif tab.focus == "items":
+            sel = tab.items.selected()
+            if sel:
+                self.activate(tab.kind, sel[0])
+        elif tab.focus == "episodes":
+            sel = tab.episodes.selected()
+            if sel:
+                self.play_episode(tab.open_series, sel[0])
+
+    def jump_to_series(self, series_id):
+        """Desde la búsqueda: ir a la pestaña Series con esa serie abierta."""
+        self.switch_tab("series")
+        tab = self.tab
+        tab.groups.filter = ""
+        tab.groups.select(ALL_ID)
+        self.fill_items(tab, keep=series_id)
+        self.open_series(series_id)
+
+    def start_search(self):
+        for kind in KINDS:
+            self.ensure_loaded(kind)
+        items, names = [], {}
+        tags = {"live": "[TV]", "movie": "[PELI]", "series": "[SERIE]"}
+        for kind in KINDS:
+            data = self.data[kind]
+            cats = {c["id"]: c["name"] for c in data["categories"]}
+            for it in data["items"]:
+                sid = f"{kind}|{it['id']}"
+                items.append((sid, f"{tags[kind]:8}{self.item_label(kind, it)}   — {cats.get(it['cat'], '')}"))
+                # sin "(LAT)", "(1972)"…: para ordenar solo cuenta el título
+                names[sid] = " ".join(normalize(re.sub(r"\(.*?\)|\[.*?\]", " ", it["name"])).split())
+        query = self.search.filter
+        self.search.names = names
+        self.search.set_items(items)
+        self.search.filter = query
+        self.mode = "search"
+        self.typing = True
+        self.status = "Busca por nombre; pon varias palabras para afinar"
+
+    def toggle_fav(self):
+        if self.mode == "search":
+            sel = self.search.selected()
+            if sel:
+                kind, iid = sel[0].split("|", 1)
+                self.toggle_item_fav(kind, iid)
+            return
+        tab = self.tab
+        if tab.focus == "groups":
+            self.toggle_pin(tab)
+        elif tab.focus == "items":
+            sel = tab.items.selected()
+            if sel:
+                item = self.find(tab.kind, sel[0])
+                if item and item.get("eid"):
+                    self.toggle_item_fav("series", item["sid"])
+                else:
+                    self.toggle_item_fav(tab.kind, sel[0])
+        elif tab.focus == "episodes":
+            self.toggle_item_fav("series", tab.open_series)
+
+    def toggle_item_fav(self, kind, item_id):
+        item = self.find(kind, item_id)
+        name = item["name"] if item else item_id
+        if item_id in self.favs[kind]:
+            self.favs[kind].remove(item_id)
+            self.status = f"Quitado de favoritos: {name}"
+        else:
+            self.favs[kind].append(item_id)
+            self.status = f"Añadido a favoritos: {name}"
+        save_json(self.favs_file, self.favs)
+        tab = self.tabs[kind]
+        group = tab.groups.selected()
+        if self.mode == "browse" and group and group[0] == FAVS_ID and tab is self.tab:
+            sel = tab.items.selected()
+            self.fill_items(tab, keep=sel[0] if sel else None)
+
+    def toggle_pin(self, tab):
+        item = tab.groups.selected()
+        if not item or item[0] in SPECIAL:
+            return
+        pinned = self.pinned[tab.kind]
+        if item[0] in pinned:
+            pinned.remove(item[0])
+            self.status = f"Grupo soltado: {item[1]}"
+        else:
+            pinned.append(item[0])
+            self.status = f"Grupo fijado arriba: {item[1]}"
+        save_json(self.groups_file, self.pinned)
+        self.build_groups(tab, keep=item[0])
+
+    def cycle_sort(self):
+        tab = self.tab
+        tab.sort = (tab.sort + 1) % len(SORTS[tab.kind])
+        sel = tab.items.selected()
+        self.fill_items(tab, keep=sel[0] if sel else None)
+        self.status = f"Orden: {SORTS[tab.kind][tab.sort]}"
 
     def switch_account(self):
         accounts = self.cfg["accounts"]
@@ -600,41 +1268,7 @@ class App:
         if choice is not None and choice is not self.account:
             self.open_account(choice)
 
-    def toggle_fav(self):
-        if self.focus is self.groups:
-            self.toggle_pin()
-            return
-        item = self.channels.selected()
-        if not item:
-            return
-        if item[0] in self.favs:
-            self.favs.discard(item[0])
-            self.status = f"Quitado de favoritos: {item[1]}"
-        else:
-            self.favs.add(item[0])
-            self.status = f"Añadido a favoritos: {item[1]}"
-        save_list(self.favs_file, sorted(self.favs))
-        if self.groups.selected() and self.groups.selected()[0] == FAVS_ID:
-            self.fill_channels()
-
-    def toggle_pin(self):
-        item = self.groups.selected()
-        if not item or item[0] in (FAVS_ID, ALL_ID):
-            return
-        if item[0] in self.pinned:
-            self.pinned.remove(item[0])
-            self.status = f"Grupo soltado: {item[1]}"
-        else:
-            self.pinned.append(item[0])
-            self.status = f"Grupo fijado arriba: {item[1]}"
-        save_list(self.groups_file, self.pinned)
-        self.build_groups()
-        # mantener el cursor sobre el mismo grupo tras reordenar
-        ids = [gid for gid, _ in self.groups.visible()]
-        self.groups.cursor = ids.index(item[0]) if item[0] in ids else 0
-
-    def handle_typing(self, key):
-        pane = self.focus
+    def handle_typing(self, key, pane, on_change):
         if key in ("\n", "\r", curses.KEY_ENTER):
             self.typing = False
         elif key == "\x1b":
@@ -642,6 +1276,8 @@ class App:
             pane.filter = ""
         elif key in (curses.KEY_BACKSPACE, "\x7f", "\b", "\x08"):
             pane.filter = pane.filter[:-1]
+        elif key == "\x15":  # Ctrl+U
+            pane.filter = ""
         elif key in (curses.KEY_UP, curses.KEY_DOWN):
             pane.move(-1 if key == curses.KEY_UP else 1)
             return
@@ -650,64 +1286,136 @@ class App:
         else:
             return
         pane.reset()
-        if pane is self.groups:
-            self.fill_channels()
+        on_change()
+
+    def focus_order(self):
+        tab = self.tab
+        order = ["groups", "items"]
+        sel = tab.items.selected()
+        if tab.kind == "series" and tab.open_series and sel and sel[0] == tab.open_series:
+            order.append("episodes")
+        return order
 
     def run(self):
         while True:
             self.draw()
             key = self.screen.get_wch()
-            if self.typing:
-                self.handle_typing(key)
+            if key == curses.KEY_RESIZE:
                 continue
-            pane = self.focus
-            page = max(1, self.screen.getmaxyx()[0] - 4)
-            before = self.groups.selected()
-            if key in ("q", "Q"):
+            if self.mode == "search":
+                self.run_search_key(key)
+            else:
+                if self.run_browse_key(key) == "quit":
+                    return
+            if key in ("q", "Q") and not self.typing and self.mode == "search":
                 return
-            elif key in ("j", curses.KEY_DOWN):
-                pane.move(1)
-            elif key in ("k", curses.KEY_UP):
-                pane.move(-1)
-            elif key == curses.KEY_NPAGE:
-                pane.move(page)
-            elif key == curses.KEY_PPAGE:
-                pane.move(-page)
-            elif key in ("g", curses.KEY_HOME):
-                pane.move(-10**9)
-            elif key in ("G", curses.KEY_END):
-                pane.move(10**9)
-            elif key in ("l", curses.KEY_RIGHT):
-                self.focus = self.channels
-            elif key in ("h", curses.KEY_LEFT):
-                self.focus = self.groups
-            elif key == "\t":
-                self.focus = self.channels if pane is self.groups else self.groups
-            elif key in ("\n", "\r", curses.KEY_ENTER):
-                self.activate()
-            elif key == "/":
-                self.typing = True
-            elif key == "\x1b":
-                pane.filter = ""
-                pane.reset()
-                if pane is self.groups:
-                    self.fill_channels()
-            elif key == "f":
-                self.toggle_fav()
-            elif key == "a":
-                self.switch_account()
-                continue
-            elif key == "x":
-                self.status = "Reproductor parado" if stop() else "No hay reproductor abierto"
-                self.playing = ""
-            elif key == "r":
-                self.load(force=True)
-                continue
-            elif key == "?":
-                self.show_help()
-            if self.groups.selected() != before:
-                self.fill_channels()
 
+    def run_search_key(self, key):
+        pane = self.search
+        if self.typing:
+            self.handle_typing(key, pane, lambda: None)
+            return
+        page = max(1, self.screen.getmaxyx()[0] - 5)
+        if key == "\x1b":
+            self.mode = "browse"
+            self.status = ""
+        elif key in ("/", "s"):
+            self.typing = True
+        elif key in ("j", curses.KEY_DOWN):
+            pane.move(1)
+        elif key in ("k", curses.KEY_UP):
+            pane.move(-1)
+        elif key == curses.KEY_NPAGE:
+            pane.move(page)
+        elif key == curses.KEY_PPAGE:
+            pane.move(-page)
+        elif key in ("g", curses.KEY_HOME):
+            pane.move(-10**9)
+        elif key in ("G", curses.KEY_END):
+            pane.move(10**9)
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            self.enter()
+        elif key == "f":
+            self.toggle_fav()
+        elif key == "i":
+            self.show_info = not self.show_info
+        elif key == "x":
+            self.status = "Reproductor parado" if stop() else "No hay reproductor abierto"
+            self.playing = ""
+        elif key in ("1", "2", "3"):
+            self.switch_tab(KINDS[int(key) - 1])
+
+    def run_browse_key(self, key):
+        tab = self.tab
+        pane = tab.pane()
+        if self.typing:
+            on_change = (lambda: self.fill_items(tab)) if tab.focus == "groups" else (lambda: None)
+            self.handle_typing(key, pane, on_change)
+            return None
+        page = max(1, self.screen.getmaxyx()[0] - 5)
+        before = tab.groups.selected()
+        order = self.focus_order()
+        if key in ("q", "Q"):
+            return "quit"
+        elif key in ("1", "2", "3"):
+            self.switch_tab(KINDS[int(key) - 1])
+            return None
+        elif key in ("j", curses.KEY_DOWN):
+            pane.move(1)
+        elif key in ("k", curses.KEY_UP):
+            pane.move(-1)
+        elif key == curses.KEY_NPAGE:
+            pane.move(page)
+        elif key == curses.KEY_PPAGE:
+            pane.move(-page)
+        elif key in ("g", curses.KEY_HOME):
+            pane.move(-10**9)
+        elif key in ("G", curses.KEY_END):
+            pane.move(10**9)
+        elif key in ("l", curses.KEY_RIGHT):
+            if tab.focus == "groups":
+                tab.focus = "items"
+            elif tab.focus == "items" and tab.kind == "series":
+                self.enter()
+        elif key in ("h", curses.KEY_LEFT):
+            tab.focus = {"episodes": "items", "items": "groups"}.get(tab.focus, "groups")
+        elif key == "\t":
+            tab.focus = order[(order.index(tab.focus) + 1) % len(order)] if tab.focus in order else "groups"
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            self.enter()
+        elif key == "/":
+            self.typing = True
+        elif key == "s":
+            self.start_search()
+            return None
+        elif key == "\x1b":
+            pane.filter = ""
+            pane.reset()
+            if tab.focus == "groups":
+                self.fill_items(tab)
+        elif key == "f":
+            self.toggle_fav()
+        elif key == "o":
+            self.cycle_sort()
+        elif key == "i":
+            self.show_info = not self.show_info
+        elif key == "a":
+            self.switch_account()
+            return None
+        elif key == "x":
+            self.status = "Reproductor parado" if stop() else "No hay reproductor abierto"
+            self.playing = ""
+        elif key == "r":
+            self.ensure_loaded(tab.kind, force=True)
+            return None
+        elif key == "?":
+            self.show_help()
+        if tab.groups.selected() != before:
+            self.fill_items(tab)
+        return None
+
+
+# ---------- selector de listas y asistente dentro de la interfaz ----------
 
 ADD = "__add__"
 
@@ -825,7 +1533,7 @@ def add_account_tui(screen, cfg):
     except Exception as exc:
         show_lines(screen, ["No funciona, no la guardo:", str(exc)])
         return None
-    show_lines(screen, [f"Lista '{name}' guardada: {len(data['streams'])} canales en {len(data['categories'])} grupos."])
+    show_lines(screen, [f"Lista '{name}' guardada: {len(data['items'])} canales en {len(data['categories'])} grupos."])
     return account
 
 
